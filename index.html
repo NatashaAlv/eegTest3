@@ -7,7 +7,6 @@
   <title>EEG Visual Experiment</title>
 
   <style>
-    /* BASIC STYLING — CUSTOMIZE THIS LATER */
     body {
       margin: 0;
       font-family: Arial, sans-serif;
@@ -16,9 +15,7 @@
       text-align: center;
     }
 
-    header {
-      padding: 20px;
-    }
+    header { padding: 20px; }
 
     canvas {
       display: block;
@@ -26,19 +23,24 @@
       height: 65vh;
     }
 
-    .controls {
-      padding: 20px;
+    .controls { padding: 20px; }
+
+    input, select {
+      max-width: 90%;
+      margin: 8px;
     }
 
-    input {
-      width: 250px;
-      max-width: 80%;
-    }
+    input[type="range"] { width: 250px; }
 
     button {
       padding: 10px 16px;
       margin: 8px;
       cursor: pointer;
+    }
+
+    #status {
+      color: #62f4ff;
+      overflow-wrap: anywhere;
     }
   </style>
 </head>
@@ -54,9 +56,25 @@
   <div class="controls">
     <p>Input mode: <strong id="mode">Simulated</strong></p>
 
+    <p>
+      <input type="file" id="csvFile" accept=".csv,.txt">
+    </p>
+
+    <p>
+      <label for="channel">Data column:</label>
+      <select id="channel" disabled>
+        <option value="">Load a recording first</option>
+      </select>
+    </p>
+
+    <button id="playButton" disabled>Play EEG Recording</button>
+    <button id="stopButton">Stop Recording</button>
     <button id="autoButton">Turn Auto Mode Off</button>
 
+    <p id="status">Choose your OpenBCI recording file to begin.</p>
+
     <p>Signal Value: <span id="value">50</span></p>
+
     <input
       id="signal"
       type="range"
@@ -65,9 +83,7 @@
       value="50"
     >
 
-    <p>
-      Move the slider to change the animation.
-    </p>
+    <p>Move the slider to test manual control.</p>
   </div>
 
   <script>
@@ -78,13 +94,21 @@
     const valueText = document.getElementById("value");
     const autoButton = document.getElementById("autoButton");
     const modeText = document.getElementById("mode");
+    const csvFile = document.getElementById("csvFile");
+    const channelSelect = document.getElementById("channel");
+    const playButton = document.getElementById("playButton");
+    const stopButton = document.getElementById("stopButton");
+    const statusText = document.getElementById("status");
 
     let signal = 50;
     let autoMode = true;
     let time = 0;
     let particles = [];
 
-    // Create particles
+    let recording = [];
+    let playbackIndex = 0;
+    let playbackTimer = null;
+
     function createParticles() {
       particles = [];
 
@@ -98,7 +122,6 @@
       }
     }
 
-    // Make canvas fit the screen
     function resizeCanvas() {
       const dpr = window.devicePixelRatio || 1;
 
@@ -109,71 +132,247 @@
     }
 
     function updateSignal(newValue) {
-      signal = Number(newValue);
+      signal = Math.max(0, Math.min(100, Number(newValue)));
       slider.value = signal;
-      valueText.textContent = signal;
+      valueText.textContent = signal.toFixed(1);
     }
 
-    // Manual signal control
-    slider.addEventListener("input", () => {
+    function stopPlayback() {
+      if (playbackTimer !== null) {
+        clearInterval(playbackTimer);
+        playbackTimer = null;
+      }
+
+      playButton.textContent = "Play EEG Recording";
+    }
+
+    function setMode(mode) {
+      modeText.textContent = mode;
+    }
+
+    // Load a recording selected from your computer.
+    csvFile.addEventListener("change", async () => {
+      stopPlayback();
       autoMode = false;
       autoButton.textContent = "Turn Auto Mode On";
-      modeText.textContent = "Manual / Simulated";
+      setMode("Loading recording");
+
+      const file = csvFile.files[0];
+      if (!file) return;
+
+      try {
+        const text = await file.text();
+
+        const lines = text
+          .replace(/^\uFEFF/, "")
+          .split(/\r?\n/)
+          .filter(line => line.trim() !== "");
+
+        // OpenBCI exports can use tabs or commas.
+        const firstLine = lines[0];
+        const delimiter = firstLine.includes("\t") ? "\t" : ",";
+
+        const parsed = lines.map(line =>
+          line.split(delimiter).map(value => value.trim())
+        );
+
+        // Keep rows containing numeric data.
+        const numericRows = parsed
+          .map(row => row.map(value => {
+            if (value === "") return NaN;
+            return Number(value);
+          }))
+          .filter(row =>
+            row.length > 1 &&
+            row.some(value => Number.isFinite(value))
+          );
+
+        if (numericRows.length < 2) {
+          throw new Error("Not enough numeric rows were found.");
+        }
+
+        // Use the most common row width to avoid malformed rows.
+        const widths = {};
+        numericRows.forEach(row => {
+          widths[row.length] = (widths[row.length] || 0) + 1;
+        });
+
+        const columnCount = Number(
+          Object.keys(widths).sort((a, b) =>
+            widths[b] - widths[a]
+          )[0]
+        );
+
+        recording = numericRows.filter(
+          row => row.length === columnCount
+        );
+
+        if (recording.length < 2) {
+          throw new Error("Could not read consistent data rows.");
+        }
+
+        channelSelect.innerHTML = "";
+
+        for (let i = 0; i < columnCount; i++) {
+          const option = document.createElement("option");
+          option.value = i;
+          option.textContent = `Column ${i + 1}`;
+          channelSelect.appendChild(option);
+        }
+
+        // Start with column 2, not the sample counter in column 1.
+        channelSelect.value = columnCount > 1 ? "1" : "0";
+        channelSelect.disabled = false;
+        playButton.disabled = false;
+
+        statusText.textContent =
+          `Loaded ${recording.length} rows and ${columnCount} columns. ` +
+          "Choose the EEG channel after confirming the file format.";
+
+        setMode("Recording loaded");
+
+      } catch (error) {
+        recording = [];
+        channelSelect.disabled = true;
+        playButton.disabled = true;
+        statusText.textContent = "Could not read file: " + error.message;
+        setMode("Error");
+      }
+    });
+
+    function playRecording() {
+      stopPlayback();
+
+      if (!recording.length) {
+        statusText.textContent = "Load a recording first.";
+        return;
+      }
+
+      autoMode = false;
+      autoButton.textContent = "Turn Auto Mode On";
+      setMode("Recorded data");
+
+      const column = Number(channelSelect.value);
+
+      // Get finite values from the selected column.
+      const samples = recording
+        .map(row => row[column])
+        .filter(value => Number.isFinite(value));
+
+      if (samples.length < 2) {
+        statusText.textContent = "This column has too few numeric samples.";
+        return;
+      }
+
+      // Normalize using the 5th and 95th percentiles so a few
+      // extreme values don't dominate the visual effect.
+      const sorted = [...samples].sort((a, b) => a - b);
+
+      const low = sorted[Math.floor((sorted.length - 1) * 0.05)];
+      const high = sorted[Math.floor((sorted.length - 1) * 0.95)];
+
+      if (high === low) {
+        statusText.textContent =
+          "This column barely changes. Try another column.";
+        return;
+      }
+
+      playbackIndex = 0;
+
+      function playNextSample() {
+        if (playbackIndex >= samples.length) {
+          stopPlayback();
+          statusText.textContent = "Playback complete.";
+          setMode("Recording finished");
+          return;
+        }
+
+        const rawValue = samples[playbackIndex];
+
+        // Convert the selected data value to the visual's 0–100 range.
+        const normalized = Math.max(
+          0,
+          Math.min(100, ((rawValue - low) / (high - low)) * 100)
+        );
+
+        updateSignal(normalized);
+
+        statusText.textContent =
+          `Playing sample ${playbackIndex + 1} of ${samples.length}. ` +
+          `Raw value: ${rawValue.toFixed(3)}`;
+
+        playbackIndex++;
+      }
+
+      // Start at approximately 50 samples per second.
+      playNextSample();
+      playbackTimer = setInterval(playNextSample, 20);
+      playButton.textContent = "Restart Recording";
+    }
+
+    playButton.addEventListener("click", playRecording);
+
+    stopButton.addEventListener("click", () => {
+      stopPlayback();
+      setMode("Stopped");
+      statusText.textContent = "Playback stopped.";
+    });
+
+    channelSelect.addEventListener("change", () => {
+      stopPlayback();
+      statusText.textContent =
+        `Selected Column ${Number(channelSelect.value) + 1}. ` +
+        "Press Play EEG Recording to test it.";
+    });
+
+    slider.addEventListener("input", () => {
+      stopPlayback();
+      autoMode = false;
+      autoButton.textContent = "Turn Auto Mode On";
+      setMode("Manual / Simulated");
       updateSignal(slider.value);
     });
 
-    // Switch between manual and automatic input
     autoButton.addEventListener("click", () => {
+      stopPlayback();
       autoMode = !autoMode;
 
       autoButton.textContent = autoMode
         ? "Turn Auto Mode Off"
         : "Turn Auto Mode On";
 
-      modeText.textContent = autoMode
-        ? "Simulated"
-        : "Manual / Simulated";
+      setMode(autoMode ? "Simulated" : "Manual / Simulated");
     });
 
     function animate() {
       const width = canvas.clientWidth;
       const height = canvas.clientHeight;
 
-      // Simulate a changing input
       if (autoMode) {
-        updateSignal(
-          50 + 40 * Math.sin(time * 0.015)
-        );
+        updateSignal(50 + 40 * Math.sin(time * 0.015));
       }
 
       time++;
 
       ctx.clearRect(0, 0, width, height);
 
-      // Signal controls the particle spread
       const intensity = signal / 100;
       const centerX = width / 2;
       const centerY = height / 2;
-      const spread = 40 + intensity * Math.min(width, height) * 0.35;
+      const spread =
+        40 + intensity * Math.min(width, height) * 0.35;
 
-      particles.forEach((particle) => {
+      const colours = ["#62f4ff", "#ff62c6", "#9b83ff"];
+
+      particles.forEach(particle => {
         const angle =
           particle.angle +
           time * 0.002 * particle.speed * (0.5 + intensity);
 
         const distance = particle.distance * spread;
-
         const x = centerX + Math.cos(angle) * distance;
         const y = centerY + Math.sin(angle) * distance;
-
         const size = particle.size * (0.5 + intensity);
-
-        // Alternate particle colours
-        const colours = [
-          "#62f4ff",
-          "#ff62c6",
-          "#9b83ff"
-        ];
 
         ctx.beginPath();
         ctx.arc(x, y, size, 0, Math.PI * 2);
